@@ -27,7 +27,6 @@ type RawPost = {
   scanId: string;
   query: string;
   authorHandle: string | null;
-  authorName: string | null;
   text: string;
   postedAt: string | null;
   sourceUrl: string;
@@ -56,7 +55,6 @@ function normalizeTweet(tweet: SocialDataTweet, query: string, scanId: string): 
     scanId,
     query,
     authorHandle,
-    authorName: tweet.user?.name ?? null,
     text,
     postedAt: tweet.tweet_created_at ?? tweet.created_at ?? null,
     sourceUrl: authorHandle ? `https://x.com/${authorHandle}/status/${id}` : `https://x.com/i/status/${id}`,
@@ -78,7 +76,7 @@ async function insertRawPosts(db: D1Database, posts: RawPost[]) {
 
   const statement = db.prepare(`
     INSERT INTO raw_posts
-      (tweet_id, scan_id, query, author_handle, author_name, text, posted_at, source_url, metrics_json)
+      (tweet_id, scan_id, query_text, author_handle, posted_at, content, metrics_json, source_url, ingested_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(tweet_id) DO NOTHING
   `);
@@ -90,11 +88,11 @@ async function insertRawPosts(db: D1Database, posts: RawPost[]) {
         post.scanId,
         post.query,
         post.authorHandle,
-        post.authorName,
-        post.text,
         post.postedAt,
-        post.sourceUrl,
+        post.text,
         post.metrics,
+        post.sourceUrl,
+        new Date().toISOString(),
       ),
     ),
   );
@@ -107,29 +105,42 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
 
   if (!candidates.length) return 0;
 
-  const statement = db.prepare(`
-    INSERT INTO narratives
-      (id, name, ticker, stage, score, first_observed_at, last_observed_at, risk, created_at, updated_at)
-    VALUES (?, ?, ?, '社媒初筛', 10, ?, ?, '尚未完成独立传播与链上验证', ?, ?)
-    ON CONFLICT(ticker) DO UPDATE SET
-      last_observed_at = excluded.last_observed_at,
-      updated_at = excluded.updated_at
-  `);
-
   const now = new Date().toISOString();
-  await db.batch(
-    candidates.map(({ ticker }) =>
-      statement.bind(
+  for (const { ticker, post } of candidates) {
+    const existing = await db
+      .prepare("SELECT id FROM narratives WHERE ticker = ? ORDER BY first_seen_at ASC LIMIT 1")
+      .bind(ticker)
+      .first<{ id: string }>();
+
+    if (existing) {
+      await db
+        .prepare(`
+          UPDATE narratives
+          SET last_seen_at = ?, post_count = post_count + 1
+          WHERE id = ?
+        `)
+        .bind(now, existing.id)
+        .run();
+      continue;
+    }
+
+    await db
+      .prepare(`
+        INSERT INTO narratives
+          (id, name, ticker, stage, score, first_seen_at, last_seen_at, independent_author_count, post_count, summary, risk)
+        VALUES (?, ?, ?, '社媒初筛', 10, ?, ?, ?, 1, ?, '尚未完成独立传播与链上验证')
+      `)
+      .bind(
         crypto.randomUUID(),
         ticker.replace(/^\$/, ""),
         ticker,
         now,
         now,
-        now,
-        now,
-      ),
-    ),
-  );
+        post.authorHandle ? 1 : 0,
+        `首次由 X 查询“${post.query}”发现。`,
+      )
+      .run();
+  }
 
   return candidates.length;
 }
@@ -145,10 +156,10 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
   const collected: RawPost[] = [];
 
   await env.DB.prepare(`
-    INSERT INTO scan_runs (id, source, status, post_count, candidate_count, estimated_cost_usd, started_at)
-    VALUES (?, ?, 'running', 0, 0, 0, ?)
+    INSERT INTO scan_runs (id, source, status, query_count, post_count, candidate_count, estimated_cost_usd, started_at)
+    VALUES (?, ?, 'running', ?, 0, 0, 0, ?)
   `)
-    .bind(scanId, source, startedAt)
+    .bind(scanId, source, QUERIES.length, startedAt)
     .run();
 
   for (const query of QUERIES) {
@@ -181,10 +192,10 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
 
   await env.DB.prepare(`
     UPDATE scan_runs
-    SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, completed_at = ?, errors_json = ?
+    SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, finished_at = ?, error_message = ?
     WHERE id = ?
   `)
-    .bind(status, uniquePosts.length, candidateCount, estimatedCostUsd, completedAt, JSON.stringify(errors), scanId)
+    .bind(status, uniquePosts.length, candidateCount, estimatedCostUsd, completedAt, errors.join(" | ") || null, scanId)
     .run();
 
   return {
