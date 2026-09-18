@@ -1,0 +1,15 @@
+{
+  "name": "mdc-ingestion",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-18",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mdc-production",
+      "database_id": "3585d3e2-1c50-4748-ae16-bbe13bf3af56"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 */3 * * *"]
+  }
+}
