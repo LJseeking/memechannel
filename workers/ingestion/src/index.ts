@@ -121,6 +121,8 @@ type DexPair = {
   pairCreatedAt?: number;
 };
 
+type DexValidationResult = "validated" | "rate_limited";
+
 type SourceProfileAggregate = {
   totalSignals: number;
   discoverySignals: number;
@@ -339,12 +341,35 @@ function asIsoTimestamp(timestamp: number | undefined) {
   return timestamp ? new Date(timestamp).toISOString() : null;
 }
 
-async function validateWithDexScreener(db: D1Database, scanId: string, narrative: EligibleNarrative) {
+async function validateWithDexScreener(
+  db: D1Database,
+  scanId: string,
+  narrative: EligibleNarrative,
+): Promise<DexValidationResult> {
   const symbol = narrative.ticker.replace(/^\$/, "");
   const queriedAt = new Date().toISOString();
   const response = await fetch(
     `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`,
   );
+
+  if (response.status === 429) {
+    await db
+      .prepare(`
+        INSERT INTO dex_validations
+          (id, narrative_id, scan_id, ticker, status, queried_at, raw_json)
+        VALUES (?, ?, ?, ?, 'rate_limited', ?, ?)
+      `)
+      .bind(
+        crypto.randomUUID(),
+        narrative.id,
+        scanId,
+        narrative.ticker,
+        queriedAt,
+        JSON.stringify({ provider: "DexScreener", status: 429, action: "deferred_to_next_scan" }),
+      )
+      .run();
+    return "rate_limited";
+  }
 
   if (!response.ok) {
     throw new Error(`${narrative.ticker}: DexScreener returned ${response.status}`);
@@ -377,7 +402,7 @@ async function validateWithDexScreener(db: D1Database, scanId: string, narrative
       .prepare("UPDATE narratives SET stage = '未发币', risk = ? WHERE id = ?")
       .bind("DexScreener 未找到 ticker 的精确基础代币匹配；继续跟踪社媒传播。", narrative.id)
       .run();
-    return;
+    return "validated";
   }
 
   await db.batch(
@@ -401,6 +426,8 @@ async function validateWithDexScreener(db: D1Database, scanId: string, narrative
       narrative.id,
     )
     .run();
+
+  return "validated";
 }
 
 async function runIngestion(env: Env, source: "manual" | "cron") {
@@ -444,9 +471,14 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
   const uniquePosts = [...new Map(collected.map((post) => [post.id, post])).values()];
   await insertRawPosts(env.DB, uniquePosts);
   const narrativeResult = await upsertTickerNarratives(env.DB, uniquePosts);
-  for (const narrative of narrativeResult.eligibleForDex) {
+  let dexDeferredCount = 0;
+  for (const [index, narrative] of narrativeResult.eligibleForDex.entries()) {
     try {
-      await validateWithDexScreener(env.DB, scanId, narrative);
+      const result = await validateWithDexScreener(env.DB, scanId, narrative);
+      if (result === "rate_limited") {
+        dexDeferredCount = narrativeResult.eligibleForDex.length - index;
+        break;
+      }
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
     }
@@ -457,10 +489,19 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
 
   await env.DB.prepare(`
     UPDATE scan_runs
-    SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, finished_at = ?, error_message = ?
+    SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, dex_deferred_count = ?, finished_at = ?, error_message = ?
     WHERE id = ?
   `)
-    .bind(status, uniquePosts.length, narrativeResult.tickerSignals, estimatedCostUsd, completedAt, errors.join(" | ") || null, scanId)
+    .bind(
+      status,
+      uniquePosts.length,
+      narrativeResult.tickerSignals,
+      estimatedCostUsd,
+      dexDeferredCount,
+      completedAt,
+      errors.join(" | ") || null,
+      scanId,
+    )
     .run();
 
   return {
@@ -471,6 +512,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     postsRetrieved: uniquePosts.length,
     tickerSignals: narrativeResult.tickerSignals,
     estimatedCostUsd,
+    dexDeferredCount,
     errors,
   };
 }
