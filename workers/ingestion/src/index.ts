@@ -104,6 +104,23 @@ type NarrativeAggregate = {
   independentAuthorCount: number;
 };
 
+type EligibleNarrative = {
+  id: string;
+  ticker: string;
+};
+
+type DexPair = {
+  chainId?: string;
+  dexId?: string;
+  url?: string;
+  pairAddress?: string;
+  baseToken?: { address?: string; symbol?: string };
+  liquidity?: { usd?: number };
+  volume?: { h24?: number };
+  marketCap?: number;
+  pairCreatedAt?: number;
+};
+
 function scoreNarrative(aggregate: NarrativeAggregate) {
   let score = 10;
   if (aggregate.scanCount >= 2) score += 20;
@@ -122,6 +139,7 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
   }
 
   const now = new Date().toISOString();
+  const eligibleNarratives: EligibleNarrative[] = [];
   for (const [ticker, evidencePosts] of byTicker) {
     const existing = await db
       .prepare("SELECT id FROM narratives WHERE ticker = ? ORDER BY first_seen_at ASC LIMIT 1")
@@ -173,9 +191,9 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
       .first<NarrativeAggregate>();
 
     const evidence = aggregate ?? { postCount: 0, scanCount: 0, independentAuthorCount: 0 };
-    const eligibleForDex = evidence.scanCount >= 2 && evidence.independentAuthorCount >= 3;
-    const stage = eligibleForDex ? "待链上验证" : "社媒初筛";
-    const risk = eligibleForDex
+    const meetsDexThreshold = evidence.scanCount >= 2 && evidence.independentAuthorCount >= 3;
+    const stage = meetsDexThreshold ? "待链上验证" : "社媒初筛";
+    const risk = meetsDexThreshold
       ? "已满足社媒独立传播阈值；尚未完成 DexScreener 链上验证"
       : "尚未完成跨扫描与独立传播验证";
 
@@ -197,9 +215,79 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
         narrativeId,
       )
       .run();
+
+    if (meetsDexThreshold) eligibleNarratives.push({ id: narrativeId, ticker });
   }
 
-  return byTicker.size;
+  return { tickerSignals: byTicker.size, eligibleForDex: eligibleNarratives };
+}
+
+function asIsoTimestamp(timestamp: number | undefined) {
+  return timestamp ? new Date(timestamp).toISOString() : null;
+}
+
+async function validateWithDexScreener(db: D1Database, scanId: string, narrative: EligibleNarrative) {
+  const symbol = narrative.ticker.replace(/^\$/, "");
+  const queriedAt = new Date().toISOString();
+  const response = await fetch(
+    `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(`${narrative.ticker}: DexScreener returned ${response.status}`);
+  }
+
+  const payload = (await response.json()) as { pairs?: DexPair[] };
+  const exactPairs = (payload.pairs ?? [])
+    .filter((pair) => pair.baseToken?.symbol?.toUpperCase() === symbol.toUpperCase())
+    .sort((left, right) => (right.liquidity?.usd ?? 0) - (left.liquidity?.usd ?? 0))
+    .slice(0, 10);
+
+  const status = exactPairs.length === 0 ? "no_exact_pair" : exactPairs.length === 1 ? "single_match" : "ambiguous_match";
+  const insert = db.prepare(`
+    INSERT INTO dex_validations
+      (id, narrative_id, scan_id, ticker, status, queried_at, chain_id, dex_id, pair_address,
+       token_address, token_symbol, liquidity_usd, volume_h24_usd, market_cap_usd,
+       pair_created_at, source_url, raw_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  if (!exactPairs.length) {
+    await insert
+      .bind(
+        crypto.randomUUID(), narrative.id, scanId, narrative.ticker, status, queriedAt,
+        null, null, null, null, null, null, null, null, null, null,
+        JSON.stringify({ pairCount: payload.pairs?.length ?? 0 }),
+      )
+      .run();
+    await db
+      .prepare("UPDATE narratives SET stage = '未发币', risk = ? WHERE id = ?")
+      .bind("DexScreener 未找到 ticker 的精确基础代币匹配；继续跟踪社媒传播。", narrative.id)
+      .run();
+    return;
+  }
+
+  await db.batch(
+    exactPairs.map((pair) =>
+      insert.bind(
+        crypto.randomUUID(), narrative.id, scanId, narrative.ticker, status, queriedAt,
+        pair.chainId ?? null, pair.dexId ?? null, pair.pairAddress ?? null,
+        pair.baseToken?.address ?? null, pair.baseToken?.symbol ?? null,
+        pair.liquidity?.usd ?? null, pair.volume?.h24 ?? null, pair.marketCap ?? null,
+        asIsoTimestamp(pair.pairCreatedAt), pair.url ?? null, JSON.stringify(pair),
+      ),
+    ),
+  );
+
+  await db
+    .prepare("UPDATE narratives SET stage = '候选合约', risk = ? WHERE id = ?")
+    .bind(
+      status === "single_match"
+        ? "发现一个 ticker 精确匹配池子；仍需核对合约与叙事来源，不能视为已验证。"
+        : "发现多个同 ticker 池子；合约存在歧义，不能自动认定为同一项目。",
+      narrative.id,
+    )
+    .run();
 }
 
 async function runIngestion(env: Env, source: "manual" | "cron") {
@@ -242,7 +330,14 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
 
   const uniquePosts = [...new Map(collected.map((post) => [post.id, post])).values()];
   await insertRawPosts(env.DB, uniquePosts);
-  const candidateCount = await upsertTickerNarratives(env.DB, uniquePosts);
+  const narrativeResult = await upsertTickerNarratives(env.DB, uniquePosts);
+  for (const narrative of narrativeResult.eligibleForDex) {
+    try {
+      await validateWithDexScreener(env.DB, scanId, narrative);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
   const estimatedCostUsd = uniquePosts.length * COST_PER_POST_USD;
   const completedAt = new Date().toISOString();
   const status = errors.length === QUERIES.length ? "failed" : errors.length ? "partial" : "completed";
@@ -252,7 +347,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, finished_at = ?, error_message = ?
     WHERE id = ?
   `)
-    .bind(status, uniquePosts.length, candidateCount, estimatedCostUsd, completedAt, errors.join(" | ") || null, scanId)
+    .bind(status, uniquePosts.length, narrativeResult.tickerSignals, estimatedCostUsd, completedAt, errors.join(" | ") || null, scanId)
     .run();
 
   return {
@@ -261,7 +356,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     status,
     queries: QUERIES,
     postsRetrieved: uniquePosts.length,
-    tickerSignals: candidateCount,
+    tickerSignals: narrativeResult.tickerSignals,
     estimatedCostUsd,
     errors,
   };
