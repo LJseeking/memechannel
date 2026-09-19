@@ -39,7 +39,24 @@ const COST_PER_POST_USD = 0.0002;
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "Content-Type, X-Run-Key",
+    },
+  });
+}
+
+function optionsResponse() {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "Content-Type, X-Run-Key",
+      "access-control-max-age": "86400",
+    },
   });
 }
 
@@ -521,6 +538,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "OPTIONS") return optionsResponse();
+
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ status: "ok", service: "mdc-ingestion" });
     }
@@ -542,6 +561,83 @@ export default {
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/opportunities") {
+      const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
+      const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.floor(requestedLimit), 1), 100) : 50;
+      const requestedStage = url.searchParams.get("stage");
+      const stage = requestedStage && requestedStage !== "全部" ? requestedStage : null;
+      const statement = env.DB.prepare(`
+        SELECT
+          n.id, n.name, n.ticker, n.stage, n.score, n.first_seen_at, n.last_seen_at,
+          n.independent_author_count, n.post_count, n.summary, n.risk,
+          COUNT(DISTINCT e.scan_id) AS scan_count,
+          latest.status AS dex_status, latest.chain_id, latest.dex_id, latest.pair_address,
+          latest.token_address, latest.token_symbol, latest.liquidity_usd,
+          latest.volume_h24_usd, latest.market_cap_usd, latest.source_url AS dex_source_url,
+          latest.queried_at AS dex_queried_at
+        FROM narratives n
+        LEFT JOIN narrative_evidence e ON e.narrative_id = n.id
+        LEFT JOIN dex_validations latest ON latest.id = (
+          SELECT d.id FROM dex_validations d
+          WHERE d.narrative_id = n.id
+          ORDER BY d.queried_at DESC, d.id DESC
+          LIMIT 1
+        )
+        WHERE (? IS NULL OR n.stage = ?)
+        GROUP BY n.id
+        ORDER BY n.score DESC, scan_count DESC, n.last_seen_at DESC
+        LIMIT ?
+      `);
+      const results = await statement.bind(stage, stage, limit).all();
+      const latestScan = await env.DB.prepare(`
+        SELECT source, status, query_count, post_count, candidate_count, estimated_cost_usd,
+               dex_deferred_count, started_at, finished_at, error_message
+        FROM scan_runs
+        WHERE status != 'running'
+        ORDER BY started_at DESC
+        LIMIT 1
+      `).first();
+      return json({
+        dataStatus: "live",
+        methodology: "候选按独立作者、跨扫描重复出现与链上核验状态排序；社媒信号不构成交易建议。",
+        latestScan,
+        opportunities: results.results,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/opportunities/")) {
+      const narrativeId = decodeURIComponent(url.pathname.slice("/opportunities/".length));
+      if (!narrativeId) return json({ error: "Opportunity id is required" }, 400);
+      const narrative = await env.DB.prepare(`
+        SELECT id, name, ticker, stage, score, first_seen_at, last_seen_at,
+               independent_author_count, post_count, summary, risk
+        FROM narratives
+        WHERE id = ?
+      `).bind(narrativeId).first();
+      if (!narrative) return json({ error: "Opportunity not found" }, 404);
+
+      const [evidence, dexValidations] = await Promise.all([
+        env.DB.prepare(`
+          SELECT e.tweet_id, e.scan_id, e.author_handle, e.observed_at,
+                 p.content, p.source_url, p.metrics_json, p.posted_at, p.query_text
+          FROM narrative_evidence e
+          LEFT JOIN raw_posts p ON p.tweet_id = e.tweet_id
+          WHERE e.narrative_id = ?
+          ORDER BY e.observed_at DESC
+          LIMIT 50
+        `).bind(narrativeId).all(),
+        env.DB.prepare(`
+          SELECT status, queried_at, chain_id, dex_id, pair_address, token_address,
+                 token_symbol, liquidity_usd, volume_h24_usd, market_cap_usd, source_url
+          FROM dex_validations
+          WHERE narrative_id = ?
+          ORDER BY queried_at DESC, id DESC
+          LIMIT 20
+        `).bind(narrativeId).all(),
+      ]);
+      return json({ dataStatus: "live", opportunity: narrative, evidence: evidence.results, dexValidations: dexValidations.results });
+    }
+
     if (request.method === "POST" && url.pathname === "/run") {
       const runKey = request.headers.get("X-Run-Key");
       if (!env.INGESTION_TRIGGER_SECRET || runKey !== env.INGESTION_TRIGGER_SECRET) {
@@ -557,7 +653,13 @@ export default {
 
     return json({
       service: "mdc-ingestion",
-      routes: { health: "GET /health", run: "POST /run" },
+      routes: {
+        health: "GET /health",
+        opportunities: "GET /opportunities",
+        opportunity: "GET /opportunities/:id",
+        sources: "GET /sources",
+        run: "POST /run",
+      },
     });
   },
 
