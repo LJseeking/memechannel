@@ -98,51 +98,108 @@ async function insertRawPosts(db: D1Database, posts: RawPost[]) {
   );
 }
 
-async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
-  const candidates = posts
-    .map((post) => ({ post, ticker: extractTicker(post.text) }))
-    .filter((candidate): candidate is { post: RawPost; ticker: string } => Boolean(candidate.ticker));
+type NarrativeAggregate = {
+  postCount: number;
+  scanCount: number;
+  independentAuthorCount: number;
+};
 
-  if (!candidates.length) return 0;
+function scoreNarrative(aggregate: NarrativeAggregate) {
+  let score = 10;
+  if (aggregate.scanCount >= 2) score += 20;
+  if (aggregate.independentAuthorCount >= 2) score += 15;
+  if (aggregate.independentAuthorCount >= 3) score += 20;
+  if (aggregate.postCount >= 5) score += 10;
+  return Math.min(score, 75);
+}
+
+async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
+  const byTicker = new Map<string, RawPost[]>();
+  for (const post of posts) {
+    const ticker = extractTicker(post.text);
+    if (!ticker) continue;
+    byTicker.set(ticker, [...(byTicker.get(ticker) ?? []), post]);
+  }
 
   const now = new Date().toISOString();
-  for (const { ticker, post } of candidates) {
+  for (const [ticker, evidencePosts] of byTicker) {
     const existing = await db
       .prepare("SELECT id FROM narratives WHERE ticker = ? ORDER BY first_seen_at ASC LIMIT 1")
       .bind(ticker)
       .first<{ id: string }>();
 
-    if (existing) {
+    const narrativeId = existing?.id ?? crypto.randomUUID();
+    if (!existing) {
+      const firstPost = evidencePosts[0];
       await db
         .prepare(`
-          UPDATE narratives
-          SET last_seen_at = ?, post_count = post_count + 1
-          WHERE id = ?
+          INSERT INTO narratives
+            (id, name, ticker, stage, score, first_seen_at, last_seen_at, independent_author_count, post_count, summary, risk)
+          VALUES (?, ?, ?, '社媒初筛', 10, ?, ?, 0, 0, ?, '尚未完成独立传播与链上验证')
         `)
-        .bind(now, existing.id)
+        .bind(
+          narrativeId,
+          ticker.replace(/^\$/, ""),
+          ticker,
+          now,
+          now,
+          `首次由 X 查询“${firstPost.query}”发现。`,
+        )
         .run();
-      continue;
     }
+
+    await db.batch(
+      evidencePosts.map((post) =>
+        db
+          .prepare(`
+            INSERT OR IGNORE INTO narrative_evidence
+              (narrative_id, tweet_id, scan_id, author_handle, observed_at)
+            VALUES (?, ?, ?, ?, ?)
+          `)
+          .bind(narrativeId, post.id, post.scanId, post.authorHandle, now),
+      ),
+    );
+
+    const aggregate = await db
+      .prepare(`
+        SELECT
+          COUNT(*) AS postCount,
+          COUNT(DISTINCT scan_id) AS scanCount,
+          COUNT(DISTINCT author_handle) AS independentAuthorCount
+        FROM narrative_evidence
+        WHERE narrative_id = ?
+      `)
+      .bind(narrativeId)
+      .first<NarrativeAggregate>();
+
+    const evidence = aggregate ?? { postCount: 0, scanCount: 0, independentAuthorCount: 0 };
+    const eligibleForDex = evidence.scanCount >= 2 && evidence.independentAuthorCount >= 3;
+    const stage = eligibleForDex ? "待链上验证" : "社媒初筛";
+    const risk = eligibleForDex
+      ? "已满足社媒独立传播阈值；尚未完成 DexScreener 链上验证"
+      : "尚未完成跨扫描与独立传播验证";
 
     await db
       .prepare(`
-        INSERT INTO narratives
-          (id, name, ticker, stage, score, first_seen_at, last_seen_at, independent_author_count, post_count, summary, risk)
-        VALUES (?, ?, ?, '社媒初筛', 10, ?, ?, ?, 1, ?, '尚未完成独立传播与链上验证')
+        UPDATE narratives
+        SET stage = ?, score = ?, last_seen_at = ?, independent_author_count = ?, post_count = ?,
+            summary = ?, risk = ?
+        WHERE id = ?
       `)
       .bind(
-        crypto.randomUUID(),
-        ticker.replace(/^\$/, ""),
-        ticker,
+        stage,
+        scoreNarrative(evidence),
         now,
-        now,
-        post.authorHandle ? 1 : 0,
-        `首次由 X 查询“${post.query}”发现。`,
+        evidence.independentAuthorCount,
+        evidence.postCount,
+        `已收集 ${evidence.postCount} 条独立帖子，来自 ${evidence.independentAuthorCount} 个账号，覆盖 ${evidence.scanCount} 次扫描。`,
+        risk,
+        narrativeId,
       )
       .run();
   }
 
-  return candidates.length;
+  return byTicker.size;
 }
 
 async function runIngestion(env: Env, source: "manual" | "cron") {

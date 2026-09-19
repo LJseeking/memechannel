@@ -5,7 +5,7 @@
 export type DataProvider = 'socialdata' | 'apify' | 'dexscreener';
 export type SocialPlatform = 'x' | 'tiktok' | 'instagram';
 export type Chain = 'BNB Chain' | 'Solana' | 'Robinhood Chain' | '未确认';
-export type Stage = '社媒初筛' | '未发币' | '候选合约' | '刚发币待验证' | '已验证未拥挤' | '已排除';
+export type Stage = '社媒初筛' | '待链上验证' | '未发币' | '候选合约' | '刚发币待验证' | '已验证未拥挤' | '已排除';
 
 export type SourceEvidence = {
   provider: DataProvider;
