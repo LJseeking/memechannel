@@ -121,6 +121,16 @@ type DexPair = {
   pairCreatedAt?: number;
 };
 
+type SourceProfileAggregate = {
+  totalSignals: number;
+  discoverySignals: number;
+  predictionSignals: number;
+  resolvedOutcomes: number;
+  hitCount: number;
+  riskOutcomeCount: number;
+  accuracy: number | null;
+};
+
 function scoreNarrative(aggregate: NarrativeAggregate) {
   let score = 10;
   if (aggregate.scanCount >= 2) score += 20;
@@ -128,6 +138,72 @@ function scoreNarrative(aggregate: NarrativeAggregate) {
   if (aggregate.independentAuthorCount >= 3) score += 20;
   if (aggregate.postCount >= 5) score += 10;
   return Math.min(score, 75);
+}
+
+function classifySignal(text: string) {
+  return /\b(bullish|buy(?:ing)?|accumulate|price target|send it|moon|100x|gem)\b|看多|目标价|买入|起飞|翻倍/i.test(text)
+    ? "explicit_prediction"
+    : "mention";
+}
+
+async function refreshSourceProfile(db: D1Database, authorHandle: string, now: string) {
+  const aggregate = await db
+    .prepare(`
+      SELECT
+        COUNT(*) AS totalSignals,
+        SUM(CASE WHEN is_first_observed = 1 THEN 1 ELSE 0 END) AS discoverySignals,
+        SUM(CASE WHEN signal_type = 'explicit_prediction' THEN 1 ELSE 0 END) AS predictionSignals,
+        SUM(CASE WHEN outcome_status != 'pending' THEN 1 ELSE 0 END) AS resolvedOutcomes,
+        SUM(CASE WHEN outcome_status = 'hit' THEN 1 ELSE 0 END) AS hitCount,
+        SUM(CASE WHEN outcome_status = 'risk' THEN 1 ELSE 0 END) AS riskOutcomeCount
+      FROM source_signals
+      WHERE author_handle = ?
+    `)
+    .bind(authorHandle)
+    .first<SourceProfileAggregate>();
+
+  const profile = aggregate ?? {
+    totalSignals: 0,
+    discoverySignals: 0,
+    predictionSignals: 0,
+    resolvedOutcomes: 0,
+    hitCount: 0,
+    riskOutcomeCount: 0,
+    accuracy: null,
+  };
+  const accuracy = profile.resolvedOutcomes > 0 ? profile.hitCount / profile.resolvedOutcomes : null;
+
+  await db
+    .prepare(`
+      INSERT INTO source_profiles
+        (author_handle, first_observed_at, last_observed_at, total_signals, discovery_signals,
+         prediction_signals, resolved_outcomes, hit_count, risk_outcome_count, accuracy, average_lead_hours, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+      ON CONFLICT(author_handle) DO UPDATE SET
+        last_observed_at = excluded.last_observed_at,
+        total_signals = excluded.total_signals,
+        discovery_signals = excluded.discovery_signals,
+        prediction_signals = excluded.prediction_signals,
+        resolved_outcomes = excluded.resolved_outcomes,
+        hit_count = excluded.hit_count,
+        risk_outcome_count = excluded.risk_outcome_count,
+        accuracy = excluded.accuracy,
+        updated_at = excluded.updated_at
+    `)
+    .bind(
+      authorHandle,
+      now,
+      now,
+      profile.totalSignals,
+      profile.discoverySignals,
+      profile.predictionSignals,
+      profile.resolvedOutcomes,
+      profile.hitCount,
+      profile.riskOutcomeCount,
+      accuracy,
+      now,
+    )
+    .run();
 }
 
 async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
@@ -177,6 +253,43 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
           .bind(narrativeId, post.id, post.scanId, post.authorHandle, now),
       ),
     );
+
+    const firstObservedTweetId = existing ? null : evidencePosts[0]?.id;
+    const sourcePosts = evidencePosts.filter((post): post is RawPost & { authorHandle: string } => Boolean(post.authorHandle));
+    const sourceHandles = [...new Set(sourcePosts.map((post) => post.authorHandle))];
+    await db.batch(
+      sourceHandles.map((authorHandle) =>
+        db
+          .prepare(`
+            INSERT OR IGNORE INTO source_profiles
+              (author_handle, first_observed_at, last_observed_at, total_signals, discovery_signals,
+               prediction_signals, resolved_outcomes, hit_count, risk_outcome_count, accuracy, average_lead_hours, updated_at)
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, NULL, NULL, ?)
+          `)
+          .bind(authorHandle, now, now, now),
+      ),
+    );
+    await db.batch(
+      sourcePosts.map((post) =>
+        db
+            .prepare(`
+              INSERT OR IGNORE INTO source_signals
+                (id, author_handle, narrative_id, tweet_id, scan_id, signal_type, is_first_observed, observed_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `)
+            .bind(
+              crypto.randomUUID(),
+              post.authorHandle,
+              narrativeId,
+              post.id,
+              post.scanId,
+              classifySignal(post.text),
+              post.id === firstObservedTweetId ? 1 : 0,
+              post.postedAt ?? now,
+            ),
+      ),
+    );
+    await Promise.all(sourceHandles.map((authorHandle) => refreshSourceProfile(db, authorHandle, now)));
 
     const aggregate = await db
       .prepare(`
@@ -368,6 +481,23 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ status: "ok", service: "mdc-ingestion" });
+    }
+
+    if (request.method === "GET" && url.pathname === "/sources") {
+      const requestedLimit = Number(url.searchParams.get("limit") ?? "20");
+      const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(Math.floor(requestedLimit), 1), 100) : 20;
+      const results = await env.DB.prepare(`
+        SELECT author_handle, first_observed_at, last_observed_at, total_signals, discovery_signals,
+               prediction_signals, resolved_outcomes, hit_count, risk_outcome_count, accuracy, average_lead_hours
+        FROM source_profiles
+        ORDER BY resolved_outcomes DESC, discovery_signals DESC, total_signals DESC
+        LIMIT ?
+      `).bind(limit).all();
+      return json({
+        dataStatus: "collecting_outcomes",
+        methodology: "准确率仅在可验证结果累计后展示；样本量不足时不进行排名。",
+        sources: results.results,
+      });
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
