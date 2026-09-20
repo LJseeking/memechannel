@@ -35,6 +35,10 @@ type RawPost = {
 
 const QUERIES = ["memecoin", "meme coin", "pumpfun"];
 const COST_PER_POST_USD = 0.0002;
+const ENRICHMENT_NARRATIVE_LIMIT = 3;
+const ENRICHMENT_EXCLUDED_TICKERS = new Set([
+  "$BTC", "$ETH", "$SOL", "$BNB", "$USDT", "$USDC", "$XRP", "$DOGE",
+]);
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -130,6 +134,60 @@ async function insertRawPosts(db: D1Database, posts: RawPost[]) {
   );
 }
 
+function enrichmentQuery(ticker: string) {
+  // One page only: SocialData charges for records returned, so a client-side slice
+  // would not reduce spend. This query is deliberately limited to recent posts.
+  return `${ticker} (CA OR contract OR mint OR website OR telegram) within_time:3h`;
+}
+
+async function getEnrichmentTargets(db: D1Database): Promise<EnrichmentTarget[]> {
+  const candidates = await db.prepare(`
+    SELECT id, ticker
+    FROM narratives
+    WHERE stage = '待链上验证'
+    ORDER BY score DESC, independent_author_count DESC, last_seen_at DESC
+    LIMIT 20
+  `).all<EnrichmentTarget>();
+
+  return candidates.results
+    .filter((candidate) => !ENRICHMENT_EXCLUDED_TICKERS.has(candidate.ticker.toUpperCase()))
+    .slice(0, ENRICHMENT_NARRATIVE_LIMIT);
+}
+
+async function enrichTopNarratives(
+  db: D1Database,
+  apiKey: string,
+  scanId: string,
+  errors: string[],
+): Promise<EnrichmentResult> {
+  const targets = await getEnrichmentTargets(db);
+  const posts: RawPost[] = [];
+  let postsRetrieved = 0;
+
+  for (const target of targets) {
+    const query = enrichmentQuery(target.ticker);
+    try {
+      const response = await fetch(
+        `https://api.socialdata.tools/twitter/search?query=${encodeURIComponent(query)}&type=Latest`,
+        { headers: { Authorization: `Bearer ${apiKey}` } },
+      );
+      if (!response.ok) throw new Error(`${target.ticker} 补证: SocialData returned ${response.status}`);
+
+      const payload = (await response.json()) as { tweets?: SocialDataTweet[] };
+      const tweets = payload.tweets ?? [];
+      postsRetrieved += tweets.length;
+      for (const tweet of tweets) {
+        const normalized = normalizeTweet(tweet, query, scanId);
+        if (normalized) posts.push(normalized);
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return { posts, queryCount: targets.length, postsRetrieved };
+}
+
 type NarrativeAggregate = {
   postCount: number;
   scanCount: number;
@@ -142,6 +200,17 @@ type EligibleNarrative = {
   evidenceText: string;
   evidenceUrls: string[];
   contractHints: string[];
+};
+
+type EnrichmentTarget = {
+  id: string;
+  ticker: string;
+};
+
+type EnrichmentResult = {
+  posts: RawPost[];
+  queryCount: number;
+  postsRetrieved: number;
 };
 
 type DexPair = {
@@ -596,6 +665,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     }
   }
 
+  const socialSearchErrorCount = errors.length;
   const uniquePosts = [...new Map(collected.map((post) => [post.id, post])).values()];
   await insertRawPosts(env.DB, uniquePosts);
   const narrativeResult = await upsertTickerNarratives(env.DB, uniquePosts);
@@ -611,20 +681,46 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }
-  const estimatedCostUsd = uniquePosts.length * COST_PER_POST_USD;
+
+  // A second, deliberately small pass is used only for the strongest unresolved
+  // narratives. It tries to find a contract/mint or an official project link.
+  const enrichment = await enrichTopNarratives(env.DB, env.SOCIALDATA_API_KEY, scanId, errors);
+  const uniqueEnrichmentPosts = [...new Map(enrichment.posts.map((post) => [post.id, post])).values()];
+  await insertRawPosts(env.DB, uniqueEnrichmentPosts);
+  const enrichmentNarratives = await upsertTickerNarratives(env.DB, uniqueEnrichmentPosts);
+  for (const [index, narrative] of enrichmentNarratives.eligibleForDex.entries()) {
+    try {
+      const result = await validateWithDexScreener(env.DB, scanId, narrative);
+      if (result === "rate_limited") {
+        dexDeferredCount += enrichmentNarratives.eligibleForDex.length - index;
+        break;
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  const enrichmentEstimatedCostUsd = enrichment.postsRetrieved * COST_PER_POST_USD;
+  const estimatedCostUsd = uniquePosts.length * COST_PER_POST_USD + enrichmentEstimatedCostUsd;
   const completedAt = new Date().toISOString();
-  const status = errors.length === QUERIES.length ? "failed" : errors.length ? "partial" : "completed";
+  const status = socialSearchErrorCount === QUERIES.length ? "failed" : errors.length ? "partial" : "completed";
 
   await env.DB.prepare(`
     UPDATE scan_runs
-    SET status = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?, dex_deferred_count = ?, finished_at = ?, error_message = ?
+    SET status = ?, query_count = ?, post_count = ?, candidate_count = ?, estimated_cost_usd = ?,
+        enrichment_query_count = ?, enrichment_post_count = ?, enrichment_estimated_cost_usd = ?,
+        dex_deferred_count = ?, finished_at = ?, error_message = ?
     WHERE id = ?
   `)
     .bind(
       status,
-      uniquePosts.length,
+      QUERIES.length + enrichment.queryCount,
+      uniquePosts.length + enrichment.postsRetrieved,
       narrativeResult.tickerSignals,
       estimatedCostUsd,
+      enrichment.queryCount,
+      enrichment.postsRetrieved,
+      enrichmentEstimatedCostUsd,
       dexDeferredCount,
       completedAt,
       errors.join(" | ") || null,
@@ -637,9 +733,14 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     source,
     status,
     queries: QUERIES,
-    postsRetrieved: uniquePosts.length,
+    postsRetrieved: uniquePosts.length + enrichment.postsRetrieved,
     tickerSignals: narrativeResult.tickerSignals,
     estimatedCostUsd,
+    enrichment: {
+      queryCount: enrichment.queryCount,
+      postsRetrieved: enrichment.postsRetrieved,
+      estimatedCostUsd: enrichmentEstimatedCostUsd,
+    },
     dexDeferredCount,
     errors,
   };
@@ -702,6 +803,7 @@ export default {
       const results = await statement.bind(stage, stage, limit).all();
       const latestScan = await env.DB.prepare(`
         SELECT source, status, query_count, post_count, candidate_count, estimated_cost_usd,
+               enrichment_query_count, enrichment_post_count, enrichment_estimated_cost_usd,
                dex_deferred_count, started_at, finished_at, error_message
         FROM scan_runs
         WHERE status != 'running'
