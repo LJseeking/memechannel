@@ -88,6 +88,21 @@ function extractTicker(text: string) {
   return text.match(/\$[A-Za-z][A-Za-z0-9]{1,14}/)?.[0]?.toUpperCase() ?? null;
 }
 
+function extractUrls(text: string) {
+  return [...text.matchAll(/https?:\/\/[^\s)\]}>,]+/gi)]
+    .map((match) => match[0].replace(/[.,!?]+$/, ""))
+    .filter((url) => {
+      try { return ["http:", "https:"].includes(new URL(url).protocol); } catch { return false; }
+    });
+}
+
+function extractContractHints(text: string) {
+  const evm = text.match(/\b0x[a-fA-F0-9]{40}\b/g) ?? [];
+  const solana = [...text.matchAll(/(?:\b(?:ca|contract|address|mint|token)\s*[:：-]?\s*)([1-9A-HJ-NP-Za-km-z]{32,44})/gi)]
+    .map((match) => match[1]);
+  return [...new Set([...evm, ...solana])];
+}
+
 async function insertRawPosts(db: D1Database, posts: RawPost[]) {
   if (!posts.length) return;
 
@@ -124,6 +139,9 @@ type NarrativeAggregate = {
 type EligibleNarrative = {
   id: string;
   ticker: string;
+  evidenceText: string;
+  evidenceUrls: string[];
+  contractHints: string[];
 };
 
 type DexPair = {
@@ -131,14 +149,59 @@ type DexPair = {
   dexId?: string;
   url?: string;
   pairAddress?: string;
-  baseToken?: { address?: string; symbol?: string };
+  baseToken?: { address?: string; symbol?: string; name?: string };
   liquidity?: { usd?: number };
   volume?: { h24?: number };
   marketCap?: number;
   pairCreatedAt?: number;
+  info?: {
+    websites?: Array<{ url?: string }>;
+    socials?: Array<{ url?: string }>;
+  };
 };
 
 type DexValidationResult = "validated" | "rate_limited";
+
+function hostnames(urls: string[]) {
+  return new Set(urls.flatMap((url) => {
+    try {
+      const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+      return hostname ? [hostname] : [];
+    } catch { return []; }
+  }));
+}
+
+function pairUrls(pair: DexPair) {
+  return [
+    ...(pair.info?.websites ?? []).map((item) => item.url),
+    ...(pair.info?.socials ?? []).map((item) => item.url),
+  ].filter((url): url is string => Boolean(url));
+}
+
+function scoreAttribution(pair: DexPair, narrative: EligibleNarrative) {
+  const evidenceHosts = hostnames(narrative.evidenceUrls);
+  const dexUrls = pairUrls(pair);
+  const matchingUrl = dexUrls.some((url) => {
+    try {
+      return evidenceHosts.has(new URL(url).hostname.toLowerCase().replace(/^www\./, ""));
+    } catch {
+      return false;
+    }
+  });
+  const tokenName = pair.baseToken?.name?.trim().toLowerCase();
+  const nameMentioned = Boolean(tokenName && tokenName.length > 2 && narrative.evidenceText.toLowerCase().includes(tokenName));
+  const reasons: string[] = [];
+  let score = 0;
+  if (matchingUrl) { score += 45; reasons.push("社媒链接与 Dex 项目链接同域"); }
+  if (nameMentioned) { score += 15; reasons.push("项目名称出现在社媒证据中"); }
+  if (pair.pairCreatedAt) {
+    const ageMs = Date.now() - pair.pairCreatedAt;
+    if (ageMs >= 0 && ageMs <= 14 * 24 * 60 * 60 * 1000) {
+      score += 10; reasons.push("池子创建时间符合早期窗口");
+    }
+  }
+  return { score, reasons };
+}
 
 type SourceProfileAggregate = {
   totalSignals: number;
@@ -348,7 +411,22 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
       )
       .run();
 
-    if (meetsDexThreshold) eligibleNarratives.push({ id: narrativeId, ticker });
+    if (meetsDexThreshold) {
+      const evidenceRows = await db.prepare(`
+        SELECT p.content
+        FROM narrative_evidence e
+        JOIN raw_posts p ON p.tweet_id = e.tweet_id
+        WHERE e.narrative_id = ?
+      `).bind(narrativeId).all<{ content: string }>();
+      const allEvidenceText = evidenceRows.results.map((row) => row.content).join("\n");
+      eligibleNarratives.push({
+        id: narrativeId,
+        ticker,
+        evidenceText: allEvidenceText,
+        evidenceUrls: extractUrls(allEvidenceText),
+        contractHints: extractContractHints(allEvidenceText),
+      });
+    }
   }
 
   return { tickerSignals: byTicker.size, eligibleForDex: eligibleNarratives };
@@ -365,8 +443,9 @@ async function validateWithDexScreener(
 ): Promise<DexValidationResult> {
   const symbol = narrative.ticker.replace(/^\$/, "");
   const queriedAt = new Date().toISOString();
+  const query = narrative.contractHints[0] ?? symbol;
   const response = await fetch(
-    `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+    `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`,
   );
 
   if (response.status === 429) {
@@ -393,12 +472,14 @@ async function validateWithDexScreener(
   }
 
   const payload = (await response.json()) as { pairs?: DexPair[] };
+  const directContract = narrative.contractHints.length > 0;
   const exactPairs = (payload.pairs ?? [])
-    .filter((pair) => pair.baseToken?.symbol?.toUpperCase() === symbol.toUpperCase())
+    .filter((pair) => directContract
+      ? narrative.contractHints.some((address) => pair.baseToken?.address?.toLowerCase() === address.toLowerCase())
+      : pair.baseToken?.symbol?.toUpperCase() === symbol.toUpperCase())
     .sort((left, right) => (right.liquidity?.usd ?? 0) - (left.liquidity?.usd ?? 0))
     .slice(0, 10);
 
-  const status = exactPairs.length === 0 ? "no_exact_pair" : exactPairs.length === 1 ? "single_match" : "ambiguous_match";
   const insert = db.prepare(`
     INSERT INTO dex_validations
       (id, narrative_id, scan_id, ticker, status, queried_at, chain_id, dex_id, pair_address,
@@ -410,38 +491,68 @@ async function validateWithDexScreener(
   if (!exactPairs.length) {
     await insert
       .bind(
-        crypto.randomUUID(), narrative.id, scanId, narrative.ticker, status, queriedAt,
+        crypto.randomUUID(), narrative.id, scanId, narrative.ticker, "no_exact_pair", queriedAt,
         null, null, null, null, null, null, null, null, null, null,
-        JSON.stringify({ pairCount: payload.pairs?.length ?? 0 }),
+        JSON.stringify({
+          pairCount: payload.pairs?.length ?? 0,
+          queryKind: directContract ? "explicit_contract" : "ticker_only",
+          attributionScore: 0,
+          reasons: ["未找到可归因的 Dex 基础代币"],
+        }),
       )
       .run();
-    await db
-      .prepare("UPDATE narratives SET stage = '未发币', risk = ? WHERE id = ?")
-      .bind("DexScreener 未找到 ticker 的精确基础代币匹配；继续跟踪社媒传播。", narrative.id)
-      .run();
+    await db.prepare("UPDATE narratives SET stage = ?, risk = ? WHERE id = ?")
+      .bind(
+        directContract ? "待链上验证" : "未发币",
+        directContract
+          ? "帖子包含合约地址，但 DexScreener 尚未返回该地址的可归因池子。"
+          : "DexScreener 未找到 ticker 的精确基础代币匹配；继续跟踪社媒传播。",
+        narrative.id,
+      ).run();
     return "validated";
   }
 
+  const scoredPairs = exactPairs.map((pair) => ({
+    pair,
+    attribution: directContract
+      ? { score: 100, reasons: ["帖子直接提供合约地址，且 Dex 基础代币地址一致"] }
+      : scoreAttribution(pair, narrative),
+  }));
+  const best = scoredPairs[0];
+  const corroborated = !directContract && best.attribution.score >= 50
+    && (scoredPairs.length === 1 || best.attribution.score > (scoredPairs[1]?.attribution.score ?? 0));
+  const status = directContract ? "direct_contract_match" : corroborated ? "corroborated_match"
+    : exactPairs.length === 1 ? "ticker_only" : "ambiguous_match";
+  const stage = directContract || corroborated ? "候选合约" : "待链上验证";
+  const risk = directContract
+    ? "社媒帖子直接提供合约地址，且与 DexScreener 基础代币地址一致；仍需继续验证流动性与项目风险。"
+    : corroborated
+      ? `社媒与 Dex 项目资料获得 ${best.attribution.score} 分交叉佐证；仍非交易建议。`
+      : exactPairs.length === 1
+        ? "仅找到一个同 ticker 池子，但缺少合约地址、官网或官方社媒交叉证据；不能自动归因。"
+        : "多个同 ticker 池子缺乏社媒交叉证据；不能自动归因到同一项目。";
+
   await db.batch(
-    exactPairs.map((pair) =>
+    scoredPairs.map(({ pair, attribution }) =>
       insert.bind(
         crypto.randomUUID(), narrative.id, scanId, narrative.ticker, status, queriedAt,
         pair.chainId ?? null, pair.dexId ?? null, pair.pairAddress ?? null,
         pair.baseToken?.address ?? null, pair.baseToken?.symbol ?? null,
         pair.liquidity?.usd ?? null, pair.volume?.h24 ?? null, pair.marketCap ?? null,
-        asIsoTimestamp(pair.pairCreatedAt), pair.url ?? null, JSON.stringify(pair),
+        asIsoTimestamp(pair.pairCreatedAt), pair.url ?? null,
+        JSON.stringify({
+          pair,
+          queryKind: directContract ? "explicit_contract" : "ticker_only",
+          attributionScore: attribution.score,
+          reasons: attribution.reasons,
+          candidateStatus: status,
+        }),
       ),
     ),
   );
 
-  await db
-    .prepare("UPDATE narratives SET stage = '候选合约', risk = ? WHERE id = ?")
-    .bind(
-      status === "single_match"
-        ? "发现一个 ticker 精确匹配池子；仍需核对合约与叙事来源，不能视为已验证。"
-        : "发现多个同 ticker 池子；合约存在歧义，不能自动认定为同一项目。",
-      narrative.id,
-    )
+  await db.prepare("UPDATE narratives SET stage = ?, risk = ? WHERE id = ?")
+    .bind(stage, risk, narrative.id)
     .run();
 
   return "validated";
