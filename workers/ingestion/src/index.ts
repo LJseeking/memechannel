@@ -36,9 +36,11 @@ type RawPost = {
 const QUERIES = ["memecoin", "meme coin", "pumpfun"];
 const COST_PER_POST_USD = 0.0002;
 const ENRICHMENT_NARRATIVE_LIMIT = 3;
-const ENRICHMENT_EXCLUDED_TICKERS = new Set([
+const GENERIC_ASSET_TICKERS = new Set([
   "$BTC", "$ETH", "$SOL", "$BNB", "$USDT", "$USDC", "$XRP", "$DOGE",
 ]);
+const DEX_VALIDATION_LIMIT_PER_SCAN = 4;
+const DEX_RATE_LIMIT_BACKOFF_MS = 6 * 60 * 60 * 1000;
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -150,7 +152,7 @@ async function getEnrichmentTargets(db: D1Database): Promise<EnrichmentTarget[]>
   `).all<EnrichmentTarget>();
 
   return candidates.results
-    .filter((candidate) => !ENRICHMENT_EXCLUDED_TICKERS.has(candidate.ticker.toUpperCase()))
+    .filter((candidate) => !GENERIC_ASSET_TICKERS.has(candidate.ticker.toUpperCase()))
     .slice(0, ENRICHMENT_NARRATIVE_LIMIT);
 }
 
@@ -456,8 +458,11 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
 
     const evidence = aggregate ?? { postCount: 0, scanCount: 0, independentAuthorCount: 0 };
     const meetsDexThreshold = evidence.scanCount >= 2 && evidence.independentAuthorCount >= 3;
-    const stage = meetsDexThreshold ? "待链上验证" : "社媒初筛";
-    const risk = meetsDexThreshold
+    const isGenericAssetTicker = GENERIC_ASSET_TICKERS.has(ticker.toUpperCase());
+    const stage = !isGenericAssetTicker && meetsDexThreshold ? "待链上验证" : "社媒初筛";
+    const risk = isGenericAssetTicker
+      ? "泛用资产 ticker，不参与候选合约归因或 DexScreener 自动晋级。"
+      : meetsDexThreshold
       ? "已满足社媒独立传播阈值；尚未完成 DexScreener 链上验证"
       : "尚未完成跨扫描与独立传播验证";
 
@@ -480,7 +485,7 @@ async function upsertTickerNarratives(db: D1Database, posts: RawPost[]) {
       )
       .run();
 
-    if (meetsDexThreshold) {
+    if (meetsDexThreshold && !isGenericAssetTicker) {
       const evidenceRows = await db.prepare(`
         SELECT p.content
         FROM narrative_evidence e
@@ -627,6 +632,55 @@ async function validateWithDexScreener(
   return "validated";
 }
 
+async function isDexBackoffActive(db: D1Database, narrativeId: string) {
+  const latest = await db.prepare(`
+    SELECT status, queried_at
+    FROM dex_validations
+    WHERE narrative_id = ?
+    ORDER BY queried_at DESC, id DESC
+    LIMIT 1
+  `).bind(narrativeId).first<{ status: string; queried_at: string }>();
+  if (latest?.status !== "rate_limited") return false;
+  const elapsed = Date.now() - Date.parse(latest.queried_at);
+  return Number.isFinite(elapsed) && elapsed >= 0 && elapsed < DEX_RATE_LIMIT_BACKOFF_MS;
+}
+
+async function validateNarrativeQueue(
+  db: D1Database,
+  scanId: string,
+  narratives: EligibleNarrative[],
+  errors: string[],
+) {
+  const uniqueNarratives = [...new Map(narratives.map((narrative) => [narrative.id, narrative])).values()];
+  let attempts = 0;
+  let deferred = 0;
+
+  for (let index = 0; index < uniqueNarratives.length; index += 1) {
+    const narrative = uniqueNarratives[index];
+    if (await isDexBackoffActive(db, narrative.id)) {
+      deferred += 1;
+      continue;
+    }
+    if (attempts >= DEX_VALIDATION_LIMIT_PER_SCAN) {
+      deferred += uniqueNarratives.length - index;
+      break;
+    }
+
+    attempts += 1;
+    try {
+      const result = await validateWithDexScreener(db, scanId, narrative);
+      if (result === "rate_limited") {
+        deferred += uniqueNarratives.length - index;
+        break;
+      }
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return { attempts, deferred };
+}
+
 async function runIngestion(env: Env, source: "manual" | "cron") {
   if (!env.SOCIALDATA_API_KEY) {
     throw new Error("SOCIALDATA_API_KEY is not configured");
@@ -669,36 +723,20 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
   const uniquePosts = [...new Map(collected.map((post) => [post.id, post])).values()];
   await insertRawPosts(env.DB, uniquePosts);
   const narrativeResult = await upsertTickerNarratives(env.DB, uniquePosts);
-  let dexDeferredCount = 0;
-  for (const [index, narrative] of narrativeResult.eligibleForDex.entries()) {
-    try {
-      const result = await validateWithDexScreener(env.DB, scanId, narrative);
-      if (result === "rate_limited") {
-        dexDeferredCount = narrativeResult.eligibleForDex.length - index;
-        break;
-      }
-    } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
-    }
-  }
 
   // A second, deliberately small pass is used only for the strongest unresolved
-  // narratives. It tries to find a contract/mint or an official project link.
+  // narratives. The resulting evidence is validated before generic ticker-only matches.
   const enrichment = await enrichTopNarratives(env.DB, env.SOCIALDATA_API_KEY, scanId, errors);
   const uniqueEnrichmentPosts = [...new Map(enrichment.posts.map((post) => [post.id, post])).values()];
   await insertRawPosts(env.DB, uniqueEnrichmentPosts);
   const enrichmentNarratives = await upsertTickerNarratives(env.DB, uniqueEnrichmentPosts);
-  for (const [index, narrative] of enrichmentNarratives.eligibleForDex.entries()) {
-    try {
-      const result = await validateWithDexScreener(env.DB, scanId, narrative);
-      if (result === "rate_limited") {
-        dexDeferredCount += enrichmentNarratives.eligibleForDex.length - index;
-        break;
-      }
-    } catch (error) {
-      errors.push(error instanceof Error ? error.message : String(error));
-    }
-  }
+  const dexQueue = await validateNarrativeQueue(
+    env.DB,
+    scanId,
+    [...enrichmentNarratives.eligibleForDex, ...narrativeResult.eligibleForDex],
+    errors,
+  );
+  const dexDeferredCount = dexQueue.deferred;
 
   const enrichmentEstimatedCostUsd = enrichment.postsRetrieved * COST_PER_POST_USD;
   const estimatedCostUsd = uniquePosts.length * COST_PER_POST_USD + enrichmentEstimatedCostUsd;
