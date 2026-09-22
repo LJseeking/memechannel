@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: '梗币雷达 · Meme Radar',
-  description: '发现正在形成的梗，验证其成币叙事与风险。',
+  title: 'Meme Channel · 多链梗币研究台',
+  description: '发现正在形成的梗，核验传播、合约归因与链上风险。',
 };
 
 export default function RootLayout({
