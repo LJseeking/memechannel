@@ -41,6 +41,8 @@ const GENERIC_ASSET_TICKERS = new Set([
 ]);
 const DEX_VALIDATION_LIMIT_PER_SCAN = 4;
 const DEX_RATE_LIMIT_BACKOFF_MS = 6 * 60 * 60 * 1000;
+const OUTCOME_CHECK_LIMIT_PER_SCAN = 3;
+const OUTCOME_HORIZONS_HOURS = [24, 24 * 7];
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -222,6 +224,7 @@ type DexPair = {
   pairAddress?: string;
   baseToken?: { address?: string; symbol?: string; name?: string };
   liquidity?: { usd?: number };
+  priceUsd?: string;
   volume?: { h24?: number };
   marketCap?: number;
   pairCreatedAt?: number;
@@ -306,9 +309,9 @@ async function refreshSourceProfile(db: D1Database, authorHandle: string, now: s
         COUNT(*) AS totalSignals,
         SUM(CASE WHEN is_first_observed = 1 THEN 1 ELSE 0 END) AS discoverySignals,
         SUM(CASE WHEN signal_type = 'explicit_prediction' THEN 1 ELSE 0 END) AS predictionSignals,
-        SUM(CASE WHEN outcome_status != 'pending' THEN 1 ELSE 0 END) AS resolvedOutcomes,
-        SUM(CASE WHEN outcome_status = 'hit' THEN 1 ELSE 0 END) AS hitCount,
-        SUM(CASE WHEN outcome_status = 'risk' THEN 1 ELSE 0 END) AS riskOutcomeCount
+        SUM(CASE WHEN signal_type = 'explicit_prediction' AND outcome_status IN ('hit', 'risk', 'neutral') THEN 1 ELSE 0 END) AS resolvedOutcomes,
+        SUM(CASE WHEN signal_type = 'explicit_prediction' AND outcome_status = 'hit' THEN 1 ELSE 0 END) AS hitCount,
+        SUM(CASE WHEN signal_type = 'explicit_prediction' AND outcome_status = 'risk' THEN 1 ELSE 0 END) AS riskOutcomeCount
       FROM source_signals
       WHERE author_handle = ?
     `)
@@ -510,6 +513,32 @@ function asIsoTimestamp(timestamp: number | undefined) {
   return timestamp ? new Date(timestamp).toISOString() : null;
 }
 
+function asPositiveNumber(value: string | number | undefined | null) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+async function scheduleOutcomeSnapshots(db: D1Database, narrativeId: string, pair: DexPair) {
+  const baselinePriceUsd = asPositiveNumber(pair.priceUsd);
+  if (!baselinePriceUsd || !pair.chainId || !pair.pairAddress) return;
+
+  const baselineAt = new Date().toISOString();
+  await db.batch(OUTCOME_HORIZONS_HOURS.map((horizonHours) => {
+    const dueAt = new Date(Date.now() + horizonHours * 60 * 60 * 1000).toISOString();
+    return db.prepare(`
+      INSERT OR IGNORE INTO outcome_snapshots
+        (id, narrative_id, chain_id, pair_address, token_address, horizon_hours,
+         baseline_at, due_at, baseline_price_usd, baseline_liquidity_usd,
+         baseline_market_cap_usd, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(), narrativeId, pair.chainId, pair.pairAddress, pair.baseToken?.address ?? null,
+      horizonHours, baselineAt, dueAt, baselinePriceUsd, pair.liquidity?.usd ?? null,
+      pair.marketCap ?? null, baselineAt,
+    );
+  }));
+}
+
 async function validateWithDexScreener(
   db: D1Database,
   scanId: string,
@@ -629,7 +658,116 @@ async function validateWithDexScreener(
     .bind(stage, risk, narrative.id)
     .run();
 
+  if (stage === "候选合约") {
+    await scheduleOutcomeSnapshots(db, narrative.id, best.pair);
+  }
+
   return "validated";
+}
+
+type DueOutcome = {
+  id: string;
+  narrative_id: string;
+  chain_id: string;
+  pair_address: string;
+  horizon_hours: number;
+  baseline_price_usd: number;
+  baseline_liquidity_usd: number | null;
+};
+
+function classifyOutcome(
+  baselinePriceUsd: number,
+  observedPriceUsd: number,
+  baselineLiquidityUsd: number | null,
+  observedLiquidityUsd: number | null,
+) {
+  const priceChangePct = ((observedPriceUsd - baselinePriceUsd) / baselinePriceUsd) * 100;
+  const liquidityChangePct = baselineLiquidityUsd && observedLiquidityUsd !== null
+    ? ((observedLiquidityUsd - baselineLiquidityUsd) / baselineLiquidityUsd) * 100
+    : null;
+  const outcomeStatus = priceChangePct <= -30 || (liquidityChangePct !== null && liquidityChangePct <= -50)
+    ? "risk"
+    : priceChangePct >= 20 ? "hit" : "neutral";
+  return { outcomeStatus, priceChangePct, liquidityChangePct };
+}
+
+async function processDueOutcomes(db: D1Database, errors: string[]) {
+  const now = new Date().toISOString();
+  const due = await db.prepare(`
+    SELECT id, narrative_id, chain_id, pair_address, horizon_hours,
+           baseline_price_usd, baseline_liquidity_usd
+    FROM outcome_snapshots
+    WHERE outcome_status = 'pending' AND due_at <= ?
+    ORDER BY due_at ASC
+    LIMIT ?
+  `).bind(now, OUTCOME_CHECK_LIMIT_PER_SCAN).all<DueOutcome>();
+
+  let resolved = 0;
+  let deferred = 0;
+  for (let index = 0; index < due.results.length; index += 1) {
+    const snapshot = due.results[index];
+    try {
+      const response = await fetch(
+        `https://api.dexscreener.com/latest/dex/pairs/${encodeURIComponent(snapshot.chain_id)}/${encodeURIComponent(snapshot.pair_address)}`,
+      );
+      if (response.status === 429) {
+        deferred = due.results.length - index;
+        break;
+      }
+      if (!response.ok) throw new Error(`结果追踪 ${snapshot.id}: DexScreener returned ${response.status}`);
+
+      const payload = (await response.json()) as { pairs?: DexPair[] };
+      const pair = (payload.pairs ?? []).find((item) => item.pairAddress?.toLowerCase() === snapshot.pair_address.toLowerCase());
+      const observedPriceUsd = asPositiveNumber(pair?.priceUsd);
+      if (!pair || !observedPriceUsd) {
+        await db.prepare(`
+          UPDATE outcome_snapshots
+          SET outcome_status = 'unavailable', observed_at = ?, outcome_note = ?
+          WHERE id = ?
+        `).bind(now, "到期时未取得可用 DexScreener 价格。", snapshot.id).run();
+        continue;
+      }
+
+      const observedLiquidityUsd = pair.liquidity?.usd ?? null;
+      const outcome = classifyOutcome(
+        snapshot.baseline_price_usd,
+        observedPriceUsd,
+        snapshot.baseline_liquidity_usd,
+        observedLiquidityUsd,
+      );
+      const note = `${snapshot.horizon_hours}h：价格 ${outcome.priceChangePct.toFixed(1)}%${outcome.liquidityChangePct === null ? "" : `，流动性 ${outcome.liquidityChangePct.toFixed(1)}%`}。`;
+      await db.prepare(`
+        UPDATE outcome_snapshots
+        SET observed_at = ?, observed_price_usd = ?, observed_liquidity_usd = ?,
+            observed_market_cap_usd = ?, price_change_pct = ?, liquidity_change_pct = ?,
+            outcome_status = ?, outcome_note = ?
+        WHERE id = ?
+      `).bind(
+        now, observedPriceUsd, observedLiquidityUsd, pair.marketCap ?? null,
+        outcome.priceChangePct, outcome.liquidityChangePct, outcome.outcomeStatus, note, snapshot.id,
+      ).run();
+
+      // Source accuracy is deliberately based on the first 24-hour outcome and
+      // explicit predictions only. Mentions are never counted as predictions.
+      if (snapshot.horizon_hours === 24) {
+        await db.prepare(`
+          UPDATE source_signals
+          SET outcome_status = ?, outcome_recorded_at = ?, outcome_note = ?
+          WHERE narrative_id = ? AND signal_type = 'explicit_prediction'
+        `).bind(outcome.outcomeStatus, now, note, snapshot.narrative_id).run();
+        const authors = await db.prepare(`
+          SELECT DISTINCT author_handle
+          FROM source_signals
+          WHERE narrative_id = ? AND signal_type = 'explicit_prediction'
+        `).bind(snapshot.narrative_id).all<{ author_handle: string }>();
+        await Promise.all(authors.results.map((author) => refreshSourceProfile(db, author.author_handle, now)));
+      }
+      resolved += 1;
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return { dueCount: due.results.length, resolved, deferred };
 }
 
 async function isDexBackoffActive(db: D1Database, narrativeId: string) {
@@ -737,6 +875,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
     errors,
   );
   const dexDeferredCount = dexQueue.deferred;
+  const outcomes = await processDueOutcomes(env.DB, errors);
 
   const enrichmentEstimatedCostUsd = enrichment.postsRetrieved * COST_PER_POST_USD;
   const estimatedCostUsd = uniquePosts.length * COST_PER_POST_USD + enrichmentEstimatedCostUsd;
@@ -780,6 +919,7 @@ async function runIngestion(env: Env, source: "manual" | "cron") {
       estimatedCostUsd: enrichmentEstimatedCostUsd,
     },
     dexDeferredCount,
+    outcomes,
     errors,
   };
 }
@@ -867,7 +1007,7 @@ export default {
       `).bind(narrativeId).first();
       if (!narrative) return json({ error: "Opportunity not found" }, 404);
 
-      const [evidence, dexValidations] = await Promise.all([
+      const [evidence, dexValidations, outcomes] = await Promise.all([
         env.DB.prepare(`
           SELECT e.tweet_id, e.scan_id, e.author_handle, e.observed_at,
                  p.content, p.source_url, p.metrics_json, p.posted_at, p.query_text
@@ -885,8 +1025,16 @@ export default {
           ORDER BY queried_at DESC, id DESC
           LIMIT 20
         `).bind(narrativeId).all(),
+        env.DB.prepare(`
+          SELECT horizon_hours, baseline_at, due_at, baseline_price_usd, baseline_liquidity_usd,
+                 observed_at, observed_price_usd, observed_liquidity_usd,
+                 price_change_pct, liquidity_change_pct, outcome_status, outcome_note
+          FROM outcome_snapshots
+          WHERE narrative_id = ?
+          ORDER BY horizon_hours ASC
+        `).bind(narrativeId).all(),
       ]);
-      return json({ dataStatus: "live", opportunity: narrative, evidence: evidence.results, dexValidations: dexValidations.results });
+      return json({ dataStatus: "live", opportunity: narrative, evidence: evidence.results, dexValidations: dexValidations.results, outcomes: outcomes.results });
     }
 
     if (request.method === "POST" && url.pathname === "/run") {
